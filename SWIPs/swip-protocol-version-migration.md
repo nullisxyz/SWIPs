@@ -155,6 +155,77 @@ During protocol version transitions (a one-hour window around activation), nodes
 - Improves interoperability — standard protobuf tooling works correctly
 - Separates concerns — wire encoding is handled by protobuf, signature construction is application logic
 
+### Why Two Versions Are Always Sufficient
+
+A critical property of this migration model is that at most two protocol versions ever need to coexist on the network at any point in time. This is sufficient to bridge any upgrade without creating disjoint subnetworks, and it holds because the migration is structured as a sequence of non-overlapping two-phase transitions.
+
+Each protocol upgrade follows the same three-phase lifecycle:
+
+1. **Phase 1 — Introduction (bilingual):** Release N introduces version V+1 alongside version V. All nodes on Release N can communicate with legacy nodes (version V only) and with each other (version V+1). The network remains fully connected because every node speaks at least version V. Version V is **deprecated** at this point — it remains functional but nodes SHOULD upgrade.
+
+2. **Phase 2 — Deprecation notice period:** Between Release N and Release N+1, version V is in a deprecated state. Nodes running Release N log warnings when they encounter V-only peers, giving operators visibility into how much of the network has migrated. This window provides the opportunity for monitoring adoption and ensuring readiness before the final cutover.
+
+3. **Phase 3 — Removal (cutover):** Release N+1 drops support for version V entirely. Nodes still speaking only version V are rejected. The network converges on version V+1 exclusively. Version V is now **removed** — not merely unsupported, but actively rejected at the handshake level.
+
+The key invariant is: **a new protocol version is never introduced until the previous migration has completed.** This means the version space at any moment is either {V} (stable), {V, V+1} (mid-migration, V deprecated), or {V+1} (stable, V removed) — never {V, V+1, V+2}. Because Release N nodes bridge between V and V+1, there is always a connected path between any two nodes on the network during migration. No subset of nodes becomes isolated.
+
+The full lifecycle of a protocol version is:
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> INTRODUCED : Version first appears in a release
+    INTRODUCED --> ACTIVE : Predecessor removed, this version is the standard
+    ACTIVE --> DEPRECATED : Successor version introduced
+    DEPRECATED --> REMOVED : Support dropped, rejected at handshake
+    REMOVED --> [*]
+```
+
+- **INTRODUCED:** The version first appears in a release, coexisting with its predecessor.
+- **ACTIVE:** The version is the current standard. All nodes are expected to support it.
+- **DEPRECATED:** A successor version has been introduced. The version still functions but nodes SHOULD migrate. Nodes log warnings when encountering peers on the deprecated version.
+- **REMOVED:** Support is dropped. Nodes on this version are rejected at the handshake.
+
+The migration timeline across successive releases:
+
+```mermaid
+gantt
+    title Protocol Version Migration Timeline
+    dateFormat X
+    axisFormat %s
+
+    section Version V
+    ACTIVE                     :active, v0a, 0, 1
+    DEPRECATED                 :crit, v0d, 1, 2
+    REMOVED                    :done, v0r, 2, 3
+
+    section Version V+1
+    INTRODUCED/ACTIVE          :active, v1i, 1, 2
+    ACTIVE                     :active, v1a, 2, 3
+    DEPRECATED                 :crit, v1d, 3, 4
+    REMOVED                    :done, v1r, 4, 5
+
+    section Version V+2
+    INTRODUCED/ACTIVE          :active, v2i, 3, 4
+    ACTIVE                     :active, v2a, 4, 5
+
+    section Releases
+    Release N (speaks V, V+1)       :milestone, m0, 1, 1
+    Release N+1 (speaks V+1 only)   :milestone, m1, 2, 2
+    Release N+2 (speaks V+1, V+2)   :milestone, m2, 3, 3
+    Release N+3 (speaks V+2 only)   :milestone, m3, 4, 4
+```
+
+**Why this prevents disjoint networks:**
+
+- During the {V, V+1} coexistence window, Release N nodes act as bridges. They accept connections from V-only nodes and V+1 nodes alike. Any V-only node can reach any V+1 node through a Release N intermediary.
+- The Hive gossip protocol reinforces this: Release N nodes advertise V-only peers to V-only nodes and V+1 peers to V+1 nodes, but they themselves are reachable by both. The address book of every node remains populated with reachable peers.
+- The grace period around activation timestamps further smooths the transition, ensuring that minor clock differences between nodes do not cause premature rejection.
+
+**What happens if a node skips an upgrade?** A node still on version V when Release N+1 lands (V+1 only) will be unable to connect. This is by design — the two-release window provides ample time for operators to upgrade. The network does not partition; the stale node simply drops off. This is analogous to Ethereum's approach where nodes that miss a hard fork end up on a dead chain rather than creating a competing subnetwork.
+
+**Constraint on upgrade cadence:** This model requires that Release N+1 is not issued until Release N has achieved sufficient adoption. In practice, this means the upgrade schedule must allow enough time between Release N and Release N+1 for the vast majority of nodes to upgrade. The protocol itself does not enforce this — it is an operational requirement on the release process.
+
 ## Backwards Compatibility
 
 This proposal introduces breaking changes to the handshake and Hive protocols:
@@ -162,18 +233,18 @@ This proposal introduces breaking changes to the handshake and Hive protocols:
 1. **Protocol version digest field** — New required field in BzzAddress
 2. **Underlay encoding** — Changes from `bytes underlay` (custom encoding) to `repeated bytes underlays` (native protobuf)
 
-Migration follows a two-release plan:
+Migration follows the two-release plan described above:
 
-1. **Release N.** Protocol version digest is optional. BzzAddress accepts both:
-   - Legacy format: `bytes underlay` with custom encoding, no digest
-   - New format: `repeated bytes underlays` with protocol version digest
-   Nodes generate the new format but accept both.
+1. **Release N (introduction — legacy format deprecated).** Protocol version digest is optional. BzzAddress accepts both:
+   - Legacy format: `bytes underlay` with custom encoding, no digest — **DEPRECATED**
+   - New format: `repeated bytes underlays` with protocol version digest — **ACTIVE**
+   Nodes generate the new format but accept both. Nodes SHOULD log warnings when encountering legacy-format peers, providing operators with visibility into migration progress. This ensures Release N nodes can communicate with all existing nodes while introducing the new protocol to the network.
 
-2. **Release N+1.** Only the new format is accepted. Legacy format is rejected.
+2. **Release N+1 (cutover — legacy format removed).** Only the new format is accepted. Legacy format is **REMOVED** — connections from nodes that do not present a protocol version digest are actively rejected at the handshake. By this point, the bilingual Release N nodes have propagated the new format through Hive gossip, and the network has converged.
 
-Once Release N is deployed, the new format will propagate through Hive gossip as nodes exchange peer information. By the time Release N+1 is deployed, the network should be predominantly using the new format.
+Once Release N is deployed, the new format will propagate through Hive gossip as nodes exchange peer information. The deprecation warning logs give operators and the community a clear signal of adoption progress before the cutover.
 
-Nodes that have not upgraded by Release N+1 will be unable to connect.
+By the time Release N+1 is deployed, the network should be predominantly using the new format. Nodes that have not upgraded by Release N+1 will be unable to connect. The network does not partition — non-upgraded nodes are simply excluded, as they can no longer speak a supported protocol version.
 
 ## Test Cases
 
