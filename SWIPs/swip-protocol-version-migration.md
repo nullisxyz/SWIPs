@@ -11,13 +11,11 @@ requires: swip-bzzaddress-signature-v1
 
 ## Simple Summary
 
-Introduce a protocol version digest mechanism that enables nodes to identify compatible peers during network upgrades via the handshake and Hive peer gossip. Additionally, clean up the underlay encoding by using proper protobuf repeated fields instead of custom serialization.
+Introduce a protocol version digest mechanism that enables nodes to identify compatible peers during network upgrades via the handshake and Hive peer gossip.
 
 ## Abstract
 
 A protocol version digest is a 4-byte identifier derived from the network configuration and current protocol version. By including this digest in both the handshake protocol and Hive peer advertisements, nodes can efficiently filter incompatible peers before connection and avoid gossiping peers that recipients cannot use.
-
-This proposal also replaces the custom underlay serialization format (magic `0x99` prefix with varint-length encoding) with idiomatic protobuf `repeated` fields, simplifying implementations and improving interoperability.
 
 ## Motivation
 
@@ -26,7 +24,6 @@ Swarm lacks a standardised mechanism for:
 1. **Peer compatibility detection.** Nodes cannot determine protocol compatibility before establishing connections.
 2. **Efficient peer gossip.** Hive broadcasts all known peers regardless of protocol compatibility, wasting bandwidth.
 3. **Graceful upgrades.** During network upgrades, incompatible nodes waste resources attempting failed connections.
-4. **Clean underlay encoding.** The current protocol uses a custom serialization format for multiple underlay addresses: a magic `0x99` prefix byte followed by varint-length-prefixed multiaddr bytes. This deviates from idiomatic protobuf usage, complicates implementations, and conflates wire encoding with application logic.
 
 ## Specification
 
@@ -74,44 +71,18 @@ version_active = current_timestamp >= activation_timestamp
 
 ### Handshake Integration
 
-The handshake protocol is updated with the protocol version digest and proper underlay encoding:
+The handshake protocol is updated with the protocol version digest. The `BzzAddress` message (as updated by the BzzAddress Signature and Underlay Encoding v1 SWIP) gains an additional field:
 
 ```protobuf
-syntax = "proto3";
-
-package handshake;
-
-message Syn {
-    bytes observed_underlay = 1;
-}
-
-message Ack {
-    BzzAddress address = 1;
-    uint64 network_id = 2;
-    bool full_node = 3;
-    bytes nonce = 4;
-    string welcome_message = 99;
-}
-
-message SynAck {
-    Syn syn = 1;
-    Ack ack = 2;
-}
-
 message BzzAddress {
-    repeated bytes underlays = 1;  // Multiple multiaddr bytes (was: single bytes with custom encoding)
+    repeated bytes underlays = 1;
     bytes signature = 2;
     bytes overlay = 3;
     bytes protocol_version_digest = 4;  // 4 bytes
 }
 ```
 
-Key changes:
-
-1. **`underlays` becomes `repeated bytes`** — Each multiaddr is a separate element. No custom serialization (no `0x99` prefix, no varint length encoding). Protobuf handles the wire format.
-2. **`protocol_version_digest` is added** — 4-byte protocol version identifier.
-
-Nodes MUST reject connections where `peer.protocol_version_digest != local.protocol_version_digest`.
+The `protocol_version_digest` field is a 4-byte protocol version identifier. Nodes MUST reject connections where `peer.protocol_version_digest != local.protocol_version_digest`.
 
 ### Hive Protocol Integration
 
@@ -147,13 +118,6 @@ During protocol version transitions (a one-hour window around activation), nodes
 **Hive integration.** Without version-aware gossip, nodes accumulate stale peer lists during upgrades, degrading connectivity.
 
 **Digest in signature.** Including the protocol version digest in the signature binds the address to a specific protocol version, preventing replay of old addresses after upgrades.
-
-**Repeated bytes for underlays.** The legacy custom encoding (magic `0x99` prefix + varint length prefixes) was a workaround for backward compatibility with single-underlay nodes. This conflates wire encoding with application logic and complicates implementations. Using protobuf's native `repeated bytes` field:
-
-- Leverages protobuf's built-in length-prefixed encoding for wire format
-- Simplifies parsing — no custom deserialization logic needed
-- Improves interoperability — standard protobuf tooling works correctly
-- Separates concerns — wire encoding is handled by protobuf, signature construction is application logic
 
 ### Why Two Versions Are Always Sufficient
 
@@ -228,19 +192,13 @@ gantt
 
 ## Backwards Compatibility
 
-This proposal introduces breaking changes to the handshake and Hive protocols:
-
-1. **Protocol version digest field** — New required field in BzzAddress
-2. **Underlay encoding** — Changes from `bytes underlay` (custom encoding) to `repeated bytes underlays` (native protobuf)
+This proposal introduces a breaking change to the handshake and Hive protocols: the addition of the `protocol_version_digest` field in `BzzAddress`. This SWIP assumes that the underlay encoding and signature changes from the BzzAddress Signature and Underlay Encoding v1 SWIP have already been adopted.
 
 Migration follows the two-release plan described above:
 
-1. **Release N (introduction — legacy format deprecated).** Protocol version digest is optional. BzzAddress accepts both:
-   - Legacy format: `bytes underlay` with custom encoding, no digest — **DEPRECATED**
-   - New format: `repeated bytes underlays` with protocol version digest — **ACTIVE**
-   Nodes generate the new format but accept both. Nodes SHOULD log warnings when encountering legacy-format peers, providing operators with visibility into migration progress. This ensures Release N nodes can communicate with all existing nodes while introducing the new protocol to the network.
+1. **Release N (introduction — legacy format deprecated).** Protocol version digest is optional. BzzAddress entries without a `protocol_version_digest` are accepted but **DEPRECATED**. Nodes generate the new format with the digest but accept both. Nodes SHOULD log warnings when encountering peers without a protocol version digest, providing operators with visibility into migration progress.
 
-2. **Release N+1 (cutover — legacy format removed).** Only the new format is accepted. Legacy format is **REMOVED** — connections from nodes that do not present a protocol version digest are actively rejected at the handshake. By this point, the bilingual Release N nodes have propagated the new format through Hive gossip, and the network has converged.
+2. **Release N+1 (cutover — legacy format removed).** Only BzzAddress entries with a valid `protocol_version_digest` are accepted. Connections from nodes that do not present a protocol version digest are **REMOVED** — actively rejected at the handshake. By this point, the bilingual Release N nodes have propagated the new format through Hive gossip, and the network has converged.
 
 Once Release N is deployed, the new format will propagate through Hive gossip as nodes exchange peer information. The deprecation warning logs give operators and the community a clear signal of adoption progress before the cutover.
 
@@ -258,16 +216,6 @@ By the time Release N+1 is deployed, the network should be predominantly using t
 | Pre/post transition outside grace period | Connection rejected |
 | Hive gossip with matching digest | Peer accepted |
 | Hive gossip with mismatched digest | Peer ignored |
-
-### Underlay Encoding
-
-| Scenario | Expected |
-|----------|----------|
-| Single underlay in repeated field | Valid |
-| Multiple underlays in repeated field | Valid |
-| Empty underlays (zero elements) | Rejected |
-| Legacy 0x99-prefixed encoding in bytes field | Accepted (Release N only) |
-| Raw multiaddr in bytes field (single underlay) | Accepted (Release N only) |
 
 ## Implementation
 
